@@ -1,0 +1,43 @@
+# Credentials — NEVER commit these [FR-NLP-005, NFR-Security]
+.env
+*.key
+*.pem
+*_token.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+.eggs/
+venv/
+.venv/
+env/
+
+# ML artefacts — use HF Model Hub instead [FR-CV-007]
+*.pth
+*.pt
+models/checkpoints/
+*.onnx
+
+# Data — use HF datasets instead
+data/raw/
+data/processed/
+*.wav
+*.flac
+*.mp3
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.cursor/
+.vscode/settings.json
+*.swp
