@@ -1,0 +1,136 @@
+# =============================================================================
+# config.yaml — DSDBA Hyperparameter Configuration
+# Project: Deepfake Speech Detection & Biometric Authentication System
+# Document: DSDBA-SRS-2026-002 v2.1
+# RULE: No hyperparameter may appear hardcoded in any Python source file.
+#       All values here are the single source of truth. NFR-Maintainability.
+# =============================================================================
+
+# ── Audio DSP Module (FR-AUD-001–011) ─────────────────────────────────────────
+audio:
+  sample_rate: 16000          # FR-AUD-002: resample target (Hz)
+  duration_sec: 2.0           # FR-AUD-004: fixed clip duration (seconds)
+  n_samples: 32000            # FR-AUD-004: 16000 Hz × 2.0 s = 32,000 samples
+  n_mels: 128                 # FR-AUD-006: number of Mel filter banks
+  n_fft: 2048                 # FR-AUD-006: FFT window size
+  hop_length: 512             # FR-AUD-006: STFT hop length
+  window: hann                # FR-AUD-006: STFT window function
+  min_duration_sec: 0.5       # FR-AUD-005: minimum accepted clip length (reject below)
+  max_file_size_mb: 20        # FR-DEP-002: maximum upload size
+  output_tensor_shape: [3, 224, 224]  # FR-AUD-008: final tensor shape [C, H, W]
+  output_dtype: float32       # FR-AUD-008: required tensor dtype
+  error_code_too_short: AUD-001       # FR-AUD-005: JSON error code
+  error_code_bad_format: AUD-002      # FR-AUD-001: unsupported format error
+  supported_formats: [wav, flac]      # FR-AUD-001: SHALL-level formats
+  optional_formats: [mp3, ogg]        # FR-AUD-011: MAY-level formats
+  resampling_method: kaiser_best      # FR-AUD-002: resampling quality
+
+# ── Computer Vision Module (FR-CV-001–009) ───────────────────────────────────
+model:
+  backbone: efficientnet_b4           # FR-CV-001: required architecture
+  pretrained_weights: imagenet1k      # FR-CV-001: ImageNet-1k pretrained
+  num_classes: 2                      # FR-CV-002: bonafide=0, spoof=1
+  head_type: linear                   # FR-CV-002: linear classification head
+  frozen_epochs: 5                    # FR-CV-003: phase 1 frozen backbone epochs
+  finetune_lr: 1.0e-4                 # FR-CV-003: max learning rate for fine-tuning
+  decision_threshold: 0.5             # FR-CV-004: bonafide if score ≥ 0.5
+  output_activation: sigmoid          # FR-CV-004: sigmoid on final logit
+  loss_function: bce_weighted         # FR-CV-005: BCE with class weights
+  checkpoint_max_mb: 250              # NFR-Performance: max .pth file size
+
+# ── Training Configuration (FR-CV-003–008) ───────────────────────────────────
+training:
+  batch_size: 16                      # Q3: verify VRAM feasibility before Sprint B
+  gradient_checkpointing: true        # Q3 mitigation: required on Colab Free Tier
+  mixed_precision: true               # Recommended for T4 GPU efficiency
+  num_workers: 2                      # DataLoader workers (Colab CPU count)
+  max_epochs: 30                      # Max training epochs
+  early_stopping_patience: 5         # Stop if AUC-ROC does not improve
+  save_every_epoch: true              # NFR-Reliability: checkpoint every epoch
+  dataset_split: for_2sec             # Q2 RESOLVED: FoR 2-second variant
+  dataset_source: kaggle              # FoR Dataset by M. Abdel-Dayem
+  hf_model_repo: ""                   # FR-CV-007: fill with your HF model repo ID
+
+  # SpecAugment (FR-CV-006 — SHOULD)
+  augmentation:
+    specaugment_enabled: true
+    time_mask_pct: 0.10               # FR-CV-006: ≤ 10% time masking
+    freq_mask_pct: 0.10               # FR-CV-006: ≤ 10% frequency masking
+    time_shift_sec: 0.1               # FR-CV-006: ±0.1 s random time shift
+    gaussian_noise_snr_db: 20         # FR-CV-006: SNR ≥ 20 dB
+
+# ── Accuracy Acceptance Criteria (FR-CV-008, NFR-Accuracy) ───────────────────
+acceptance_criteria:
+  target_eer: 0.10                    # FR-CV-008: EER ≤ 10% on FoR test set
+  target_auc_roc: 0.90                # FR-CV-008: AUC-ROC ≥ 0.90
+  target_f1_macro: 0.88               # NFR-Accuracy
+  target_overall_accuracy: 0.90       # NFR-Accuracy: ≥ 90%
+  target_ece: 0.05                    # NFR-Accuracy: ECE ≤ 0.05 [Assumption]
+  target_xai_faithfulness: 0.65       # NFR-Accuracy: Grad-CAM deletion AUC [Assumption]
+
+# ── Grad-CAM / XAI Module (FR-CV-010–016) ────────────────────────────────────
+gradcam:
+  target_layer: "model.features[8]"   # FR-CV-010/011: LOCKED in Phase 2 (Q4 resolved)
+  library: pytorch_grad_cam            # FR-CV-011: jacobgil/pytorch-grad-cam
+  colormap: jet                        # FR-CV-012: overlay colormap
+  overlay_alpha: 0.5                   # FR-CV-012: blending alpha
+  output_format: png                   # FR-CV-012: heatmap output format
+  # Frequency band boundaries in Hz (FR-CV-013)
+  band_hz:
+    low: [0, 500]                      # Band 1: 0–500 Hz
+    low_mid: [500, 2000]               # Band 2: 500 Hz–2 kHz
+    high_mid: [2000, 4000]             # Band 3: 2–4 kHz
+    high: [4000, 8000]                 # Band 4: 4–8 kHz
+  band_normalisation: softmax          # FR-CV-014: Softmax → bands sum to 100%
+  latency_target_ms: 3000              # FR-CV-015: ≤ 3,000 ms on CPU
+  expose_raw_saliency: true            # FR-CV-016: JSON endpoint for dev access
+
+# ── NLP / Qwen 2.5 Module (FR-NLP-001–009) ───────────────────────────────────
+nlp:
+  primary_provider: qwen_2.5           # FR-NLP-002: primary LLM (Q1 RESOLVED)
+  fallback_provider: gemma_3           # FR-NLP-007: secondary LLM fallback
+  final_fallback: rule_based           # FR-NLP-003: always-available template
+  timeout_sec: 30                      # FR-NLP-002: API call timeout
+  explanation_min_sentences: 3         # FR-NLP-001: prompt instruction
+  explanation_max_sentences: 5         # FR-NLP-001: prompt instruction
+  output_language: english             # FR-NLP-004: English explanation output
+  warning_badge_text: "AI explanation unavailable"  # FR-NLP-003: UI warning
+  # API credentials: NEVER stored here — use HF Spaces secrets [FR-NLP-005]
+  api_key_env_var: QWEN_API_KEY        # Name of the Spaces secret (not the value)
+  hf_token_env_var: HF_TOKEN           # Name of the HF token secret
+
+  # NLP caching (FR-NLP-008 — SHOULD)
+  caching:
+    enabled: true
+    cache_key_fields: [label, confidence_bucket, top_band]
+    confidence_buckets: [0.5, 0.6, 0.7, 0.8, 0.9, 1.0]
+
+# ── Deployment / UI Module (FR-DEP-001–010) ──────────────────────────────────
+deployment:
+  framework: gradio                    # FR-DEP-001: lock choice here — Q6 pending
+  gradio_version: "4"                  # FR-DEP-001: Gradio 4.x
+  auth_required: false                 # FR-DEP-001: public access, no login
+  max_upload_mb: 20                    # FR-DEP-002: max audio file size
+  onnx_enabled: true                   # FR-DEP-010: ONNX Runtime mandatory
+  onnx_execution_providers: [CPUExecutionProvider]  # HF Spaces CPU-only
+  onnx_latency_target_ms: 1500         # FR-DEP-010 + NFR-Scalability
+  onnx_equivalence_tolerance: 1.0e-5   # FR-DEP-010: |ONNX - PyTorch| < 1e-5
+  e2e_latency_target_ms: 15000         # FR-DEP-007: end-to-end wall time
+  cold_start_target_sec: 30            # NFR-Reliability: HF Spaces cold-start
+  hf_space_repo: ""                    # FR-DEP-001: fill with your HF Space ID
+  demo_samples:
+    bonafide: 2                        # FR-DEP-008: number of bonafide samples
+    spoof: 2                           # FR-DEP-008: number of spoof samples
+  about_section: true                  # FR-DEP-009: include About panel
+  dataset_citation: "Abdel-Dayem, M. (2023). Fake-or-Real (FoR) Dataset. Kaggle."
+
+# ── Performance NFR Targets (NFR-Performance) ────────────────────────────────
+performance_targets:
+  audio_dsp_ms: 500                    # Audio preprocessing per 2-second clip
+  cv_inference_no_onnx_ms: 3000        # EfficientNet-B4 forward pass, no ONNX
+  cv_inference_onnx_ms: 1500           # EfficientNet-B4 via ONNX Runtime
+  gradcam_ms: 3000                     # Saliency + band attribution
+  nlp_api_ms: 8000                     # Qwen 2.5 time-to-first-byte
+  e2e_ms: 15000                        # Upload → full result display
+  training_throughput_samples_per_sec: 60  # EfficientNet-B4 on Colab T4
+  checkpoint_max_mb: 250               # Serialised .pth file on HF Hub
