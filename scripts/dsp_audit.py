@@ -27,7 +27,7 @@ def main() -> int:
     cfg = yaml.safe_load((root / "config.yaml").read_text())
 
     random.seed(args.seed)
-    exts = {".wav", ".flac", ".mp3", ".ogg"}
+    exts = {".wav"}
 
     buckets = [
         ("train", "bonafide"),
@@ -71,7 +71,7 @@ def main() -> int:
                 failed += 1
                 err_codes[exc.code] = err_codes.get(exc.code, 0) + 1
                 failures.append((str(fp), exc.code))
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:  
                 failed += 1
                 code = type(exc).__name__
                 err_codes[code] = err_codes.get(code, 0) + 1
