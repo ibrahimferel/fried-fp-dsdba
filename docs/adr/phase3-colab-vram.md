@@ -3,36 +3,33 @@
 **Document:** DSDBA-SRS-2026-002 v2.1
 **Phase:** 3 - Environment Setup & MCP Configuration
 **SRS refs:** Q3 (VRAM feasibility), Sprint B (FR-CV-003-008)
-**Label:** [Phase 3 | v1 | Q3-PENDING]
+**Label:** [Phase 3 | v2 | Q3-RESOLVED]
 
 ## Measurement status
 
-Run `notebooks/dsdba_training.ipynb` and execute:
-- **Cell 4 - Q3 VRAM Stress Test (CRITICAL)**
+Executed from `notebooks/dsdba_training.ipynb` Cell 4 on Colab GPU runtime.
+Decision threshold is **12GB** for non-AMP peak VRAM.
 
-## VRAM table (fill after execution)
-
-Assumption: decision threshold is **12GB** (non-AMP peak VRAM).
+## VRAM table (empirical)
 
 | batch | AMP | peak VRAM (GB) |
 |------:|:---:|----------------:|
-| 16 | OFF | [TBD] |
-| 16 | ON  | [TBD] |
-| 8  | OFF | [TBD] |
-| 8  | ON  | [TBD] |
-| 4  | OFF | [TBD] |
-| 4  | ON  | [TBD] |
+| 16 | OFF | 3.56 |
+| 16 | ON  | 1.84 |
+| 8  | OFF | 1.83 |
+| 8  | ON  | 1.00 |
+| 4  | OFF | 0.98 |
+| 4  | ON  | 0.57 |
 
-## Final decision (fill after execution)
+## Final decision
 
 | Decision field | Value |
 |----------------|-------|
-| `training.batch_size` | [TBD] |
-| `training.gradient_checkpointing` | [TBD] |
-| Justification | [TBD] |
+| `training.batch_size` | 16 |
+| `training.gradient_checkpointing` | false |
+| Justification | Non-AMP peak at batch 16 is 3.56 GB, well below 12 GB threshold |
 
-## Next action (required)
+## Notes
 
-Send me the printed summary from Cell 4:
-- Selected `batch_size`
-- Selected `gradient_checkpointing`
+- Colab log showed deprecation warnings for `torch.cuda.amp.*`.
+- Future cleanup item: migrate to `torch.amp.GradScaler('cuda', ...)` and `torch.amp.autocast('cuda', ...)` in notebook.
