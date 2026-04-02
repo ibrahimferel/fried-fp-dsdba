@@ -1,0 +1,54 @@
+# =============================================================================
+# requirements.txt — DSDBA Pinned Dependencies
+# DSDBA-SRS-2026-002 v2.1 | NFR-Security: exact versions required
+# Generated from: Google Colab Free Tier (Python 3.10, CUDA 11.8 / T4)
+# Serving environment: HuggingFace Spaces (CPU-only, Python 3.10)
+# =============================================================================
+
+# ── Core ML Framework ─────────────────────────────────────────────────────────
+torch==2.1.0                     # FR-CV-001: PyTorch 2.x
+torchvision==0.16.0              # FR-CV-001: EfficientNet-B4 pretrained weights
+torchaudio==2.1.0                # FR-AUD-001: audio I/O (MP3/OGG optional formats)
+
+# ── Audio DSP ─────────────────────────────────────────────────────────────────
+librosa==0.10.1                  # FR-AUD-006: Mel spectrogram extraction
+soundfile==0.12.1                # FR-AUD-001: WAV/FLAC read support
+numpy==1.24.4                    # FR-AUD-007: numerical operations
+
+# ── Computer Vision / XAI ─────────────────────────────────────────────────────
+grad-cam==1.5.0                  # FR-CV-011: jacobgil/pytorch-grad-cam
+Pillow==10.0.1                   # FR-CV-012: PNG image generation for heatmaps
+matplotlib==3.7.3                # FR-CV-012: jet colormap rendering
+scikit-learn==1.3.0              # FR-CV-008: EER / AUC-ROC evaluation metrics
+
+# ── ONNX Runtime ──────────────────────────────────────────────────────────────
+onnx==1.14.1                     # FR-DEP-010: ONNX model format
+onnxruntime==1.16.3              # FR-DEP-010: CPU inference — CPUExecutionProvider
+
+# ── NLP / API ─────────────────────────────────────────────────────────────────
+openai==1.3.0                    # FR-NLP-002: Qwen 2.5 API client (OpenAI-compatible)
+httpx==0.25.0                    # FR-NLP-002: async HTTP client for API calls
+aiohttp==3.8.6                   # FR-NLP-006: async invocation isolation
+
+# ── Deployment / UI ───────────────────────────────────────────────────────────
+gradio==4.7.1                    # FR-DEP-001: web interface (lock after Q6 resolved)
+pydantic==2.4.2                  # config.yaml validation (src/utils/config.py)
+python-dotenv==1.0.0             # .env.example support for local development
+
+# ── HuggingFace Ecosystem ─────────────────────────────────────────────────────
+huggingface-hub==0.19.4          # FR-CV-007: Model Hub upload/download
+datasets==2.14.6                 # FoR dataset access via HuggingFace datasets
+
+# ── Configuration & Utilities ─────────────────────────────────────────────────
+PyYAML==6.0.1                    # config.yaml loading
+pathlib2==2.3.7.post1            # Path operations (Python 3.10 compatibility)
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest==7.4.3                    # All test_*.py files
+pytest-asyncio==0.21.1           # Async test support (test_nlp.py)
+pytest-timeout==2.2.0            # Latency assertion enforcement
+
+# ── Code Quality (development only) ──────────────────────────────────────────
+black==23.9.1                    # R.E.F.A.C.T.: code formatting
+mypy==1.6.1                      # R.E.F.A.C.T.: strict type checking
+flake8==6.1.0                    # R.E.F.A.C.T.: style compliance
