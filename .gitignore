@@ -7,4 +7,9 @@ data/processed/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
+
+# Secrets — never commit (template is .env.example, tracked)
+.env
+
+models/checkpoints
+.venv
