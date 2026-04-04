@@ -179,12 +179,16 @@ def train_epoch(
     with torch.cuda.amp.autocast(enabled=use_amp):
       logits = model(x)
       loss = criterion(logits, y)
+    max_grad_norm = float(cfg["training"].get("max_grad_norm", 1.0))
     if use_amp and scaler is not None:
       scaler.scale(loss).backward()
+      scaler.unscale_(optimizer)
+      nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
       scaler.step(optimizer)
       scaler.update()
     else:
       loss.backward()
+      nn.utils.clip_grad_norm_(model.parameters(), max_norm=max_grad_norm)
       optimizer.step()
 
     total_loss += float(loss.item()) * x.size(0)
@@ -215,7 +219,11 @@ def validate_epoch(
     x = x.to(device)
     with torch.cuda.amp.autocast(enabled=use_amp):
       logits = model(x)
-    spoof_scores = torch.sigmoid(logits[:, 1]).detach().cpu().numpy()
+    spoof_scores = torch.sigmoid(logits[:, 1]).detach().cpu().float().numpy()
+    mask = np.isfinite(spoof_scores)
+    if not mask.all():
+      log_warning(stage="cv_train", message="nan_in_val_scores", data={"nan_count": int((~mask).sum())})
+      spoof_scores = np.where(mask, spoof_scores, 0.5)
     y_scores.extend(spoof_scores.tolist())
     y_true.extend(y.numpy().tolist())
 

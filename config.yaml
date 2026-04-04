@@ -53,6 +53,7 @@ training:
   batch_size: 16 # Q3: verify VRAM feasibility before Sprint B
   gradient_checkpointing: false # Q3 resolved: empirical Colab run shows batch 16 fits without checkpointing
   mixed_precision: true # Recommended for T4 GPU efficiency
+  max_grad_norm: 1.0 # Gradient clipping to prevent NaN with AMP
   num_workers: 2 # DataLoader workers (Colab CPU count)
   max_epochs: 30 # Max training epochs
   early_stopping_patience: 5 # Stop if AUC-ROC does not improve
