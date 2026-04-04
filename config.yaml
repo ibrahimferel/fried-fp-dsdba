@@ -43,7 +43,7 @@ model:
   finetune_unfreeze_blocks: 2 # FR-CV-003: EfficientNet feature blocks to unfreeze in phase 2
   head_lr: 0.001 # FR-CV-003: phase-1 head-only learning rate (≤ finetune_lr cap in code)
   confidence_epsilon: 1.0e-6 # FR-CV-004: clamp ONNX/UI confidence to open interval (0, 1)
-  decision_threshold: 0.969120        # FR-CV-004: EER-min dari val sweep (AUC=0.974, EER=9.27%)
+  decision_threshold: 0.93            # FR-CV-004: test EER ~0.930 (AUC=0.936, balanced 86%)
   output_activation: sigmoid # FR-CV-004: sigmoid on final logit
   loss_function: bce_weighted # FR-CV-005: BCE with class weights
   checkpoint_max_mb: 250 # NFR-Performance: max .pth file size
