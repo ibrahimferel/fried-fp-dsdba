@@ -55,7 +55,6 @@ class DSDBAModel(nn.Module):
     self.backbone.classifier[-1] = nn.Linear(in_features, num_classes)
 
   def freeze_backbone(self) -> None:
-    """Freeze all backbone parameters except classifier head."""
     for param in self.backbone.features.parameters():
       param.requires_grad = False
     for param in self.backbone.avgpool.parameters():
