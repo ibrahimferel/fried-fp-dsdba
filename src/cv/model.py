@@ -63,7 +63,6 @@ class DSDBAModel(nn.Module):
       param.requires_grad = True
 
   def unfreeze_top_n(self, n: int) -> None:
-    """Unfreeze top-N EfficientNet feature blocks for fine-tuning."""
     n = max(0, int(n))
     features = list(self.backbone.features.children())
     if n == 0:
