@@ -1,15 +1,19 @@
-# Data — use HF datasets instead
-data/raw/
-data/processed/
-*.wav
-*.flac
-*.mp3
-
-# Jupyter
-.ipynb_checkpoints/
-
-# Secrets — never commit (template is .env.example, tracked)
+# Environment & secrets
 .env
+*.env
 
-models/checkpoints
-.venv
+# Model files (upload ke HF Hub, bukan GitHub)
+*.pth
+*.onnx
+*.bin
+*.safetensors
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS files
+.DS_Store
+Thumbs.db

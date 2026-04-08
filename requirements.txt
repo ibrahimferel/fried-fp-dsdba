@@ -2,7 +2,9 @@
 # requirements.txt — DSDBA Pinned Dependencies
 # DSDBA-SRS-2026-002 v2.1 | NFR-Security: exact versions required
 # Generated from: Google Colab Free Tier (Python 3.10, CUDA 11.8 / T4)
-# Serving environment: HuggingFace Spaces (CPU-only, Python 3.10)
+# Serving environment: HuggingFace Spaces (CPU-only). README frontmatter MUST include:
+#   python_version: "3.10"
+# Otherwise the default Python 3.13 image cannot install torch==2.1.0 (no cp313 wheels).
 # =============================================================================
 
 # ── Core ML Framework ─────────────────────────────────────────────────────────
@@ -23,7 +25,8 @@ scikit-learn==1.3.0              # FR-CV-008: EER / AUC-ROC evaluation metrics
 
 # ── ONNX Runtime ──────────────────────────────────────────────────────────────
 onnx==1.14.1                     # FR-DEP-010: ONNX model format
-onnxruntime==1.16.3              # FR-DEP-010: CPU inference — CPUExecutionProvider
+# 1.16.x wheels hit "cannot enable executable stack" on glibc 2.41+ (HF Spaces).
+onnxruntime==1.23.2              # FR-DEP-010: CPU inference — CPUExecutionProvider
 
 # ── NLP / API ─────────────────────────────────────────────────────────────────
 openai==1.3.0                    # FR-NLP-002: Qwen 2.5 API client (OpenAI-compatible)
@@ -31,7 +34,9 @@ httpx==0.25.0                    # FR-NLP-002: async HTTP client for API calls
 aiohttp==3.8.6                   # FR-NLP-006: async invocation isolation
 
 # ── Deployment / UI ───────────────────────────────────────────────────────────
-gradio==4.7.1                    # FR-DEP-001: web interface (lock after Q6 resolved)
+# Gradio is installed by Hugging Face Spaces (gradio[oauth]==sdk_version from README).
+# Do not pin gradio here — it conflicts with the Space builder's pip install line.
+# Local dev: pip install "gradio[oauth]==4.44.0" (match README sdk_version).
 pydantic==2.4.2                  # config.yaml validation (src/utils/config.py)
 python-dotenv==1.0.0             # .env.example support for local development
 
@@ -52,3 +57,4 @@ pytest-timeout==2.2.0            # Latency assertion enforcement
 black==23.9.1                    # R.E.F.A.C.T.: code formatting
 mypy==1.6.1                      # R.E.F.A.C.T.: strict type checking
 flake8==6.1.0                    # R.E.F.A.C.T.: style compliance
+pydub

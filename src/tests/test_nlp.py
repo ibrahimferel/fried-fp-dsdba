@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import re
 from pathlib import Path
+from typing import Any
+from unittest.mock import AsyncMock, patch
 
 import pytest
+import yaml
 
 from src.nlp.explain import (
   NLPTimeoutError,
@@ -15,144 +19,151 @@ from src.nlp.explain import (
 )
 
 
-@pytest.fixture()
-def cfg() -> dict:
-  # Minimal cfg subset for NLP functions.
-  return {
-    "nlp": {
-      "timeout_sec": 0.01,
-      "explanation_min_sentences": 3,
-      "explanation_max_sentences": 5,
-      "api_key_env_var": "QWEN_API_KEY",
-      "hf_token_env_var": "HF_TOKEN",
-      "qwen_model": "Qwen/Qwen2.5-7B-Instruct",
-      "gemma_model": "google/gemma-2-9b-it",
-      "caching": {
-        "enabled": True,
-        "cache_key_fields": ["label", "confidence_bucket", "top_band"],
-        "confidence_buckets": [0.5, 0.6, 0.7, 0.8, 0.9, 1.0],
-      },
-    }
-  }
+def _load_cfg() -> dict[str, Any]:
+  root = Path(__file__).resolve().parents[2]
+  return yaml.safe_load((root / "config.yaml").read_text())
 
 
-@pytest.fixture()
-def band_pct() -> dict[str, float]:
-  return {"low": 10.0, "low_mid": 20.0, "high_mid": 30.0, "high": 40.0}
+@pytest.fixture(scope="module")
+def cfg() -> dict[str, Any]:
+  return _load_cfg()
 
 
-def test_build_prompt_contains_all_fields(cfg: dict, band_pct: dict[str, float]) -> None:
-  prompt = build_prompt(label="spoof", confidence=0.9123, band_pct=band_pct, cfg=cfg)
-  assert "Prediction label: spoof" in prompt
-  assert "Confidence:" in prompt
-  for k in ("low", "low_mid", "high_mid", "high"):
+def _sample_inputs() -> tuple[str, float, dict[str, float]]:
+  label = "spoof"
+  confidence = 0.73  # ratio in [0,1]
+  band_pct = {"low": 10.0, "low_mid": 25.0, "high_mid": 30.0, "high": 35.0}
+  return label, confidence, band_pct
+
+
+def test_build_prompt_contains_all_fields(cfg: dict[str, Any]) -> None:
+  label, confidence, band_pct = _sample_inputs()
+  prompt = build_prompt(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+  assert label in prompt
+  assert str(float(confidence)) in prompt
+  for k in ["low", "low_mid", "high_mid", "high"]:
     assert k in prompt
 
 
-def test_rule_based_fallback_always_returns(band_pct: dict[str, float]) -> None:
-  out = build_rule_based_explanation(label="bonafide", confidence=0.55, band_pct=band_pct)
+def test_rule_based_fallback_always_returns() -> None:
+  label = "bonafide"
+  confidence = 0.91
+  band_pct = {"low": 20.0, "low_mid": 20.0, "high_mid": 30.0, "high": 30.0}
+  out = build_rule_based_explanation(label=label, confidence=confidence, band_pct=band_pct)
   assert isinstance(out, str)
   assert out.strip() != ""
 
 
-def test_rule_based_grammar(band_pct: dict[str, float]) -> None:
-  out = build_rule_based_explanation(label="spoof", confidence=0.9, band_pct=band_pct)
-  # crude sentence count: split on ".", keep non-empty.
-  sentences = [s.strip() for s in out.split(".") if s.strip()]
+def test_rule_based_grammar() -> None:
+  label, confidence, band_pct = _sample_inputs()
+  out = build_rule_based_explanation(label=label, confidence=confidence, band_pct=band_pct)
+  assert out.strip() != ""
+  sentences = [s for s in re.split(r"[.!?]+", out) if s.strip()]
   assert len(sentences) >= 3
 
 
 @pytest.mark.asyncio
-async def test_qwen_timeout_triggers_fallback(monkeypatch: pytest.MonkeyPatch, cfg: dict, band_pct: dict[str, float]) -> None:
-  async def fake_qwen(*_args, **_kwargs) -> str:
-    raise NLPTimeoutError(provider="qwen_2_5", timeout_sec=float(cfg["nlp"]["timeout_sec"]))
+async def test_qwen_timeout_triggers_fallback(cfg: dict[str, Any]) -> None:
+  cfg_local = copy.deepcopy(cfg)
+  label, confidence, band_pct = _sample_inputs()
 
-  async def fake_gemma(*_args, **_kwargs) -> str:
-    raise RuntimeError("fallback also fails")
+  async def _timeout(*args: Any, **kwargs: Any) -> str:
+    raise NLPTimeoutError("timeout")
 
-  from src.nlp import explain as mod
+  expected_rule_based = build_rule_based_explanation(label=label, confidence=confidence, band_pct=band_pct)
 
-  monkeypatch.setattr(mod, "call_qwen_api", fake_qwen)
-  monkeypatch.setattr(mod, "call_gemma_fallback", fake_gemma)
+  with (
+    patch("src.nlp.explain.call_qwen_api", new=_timeout),
+    patch("src.nlp.explain.call_gemma_fallback", new=_timeout),
+  ):
+    explanation, api_was_used = await generate_explanation(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg_local)
 
-  text, api_used = await generate_explanation("spoof", 0.8, band_pct, cfg)
-  assert isinstance(text, str) and text.strip()
-  assert api_used is False
-
-
-@pytest.mark.asyncio
-async def test_warning_flag_on_fallback(monkeypatch: pytest.MonkeyPatch, cfg: dict, band_pct: dict[str, float]) -> None:
-  async def fail_qwen(*_args, **_kwargs) -> str:
-    raise RuntimeError("boom")
-
-  from src.nlp import explain as mod
-
-  monkeypatch.setattr(mod, "call_qwen_api", fail_qwen)
-  monkeypatch.setattr(mod, "call_gemma_fallback", fail_qwen)
-
-  _, api_used = await generate_explanation("bonafide", 0.51, band_pct, cfg)
-  assert api_used is False
+  assert explanation == expected_rule_based
+  assert api_was_used is False
 
 
 @pytest.mark.asyncio
-async def test_cv_result_independent_of_nlp(monkeypatch: pytest.MonkeyPatch, cfg: dict, band_pct: dict[str, float]) -> None:
-  async def slow_qwen(*_args, **_kwargs) -> str:
-    await asyncio.sleep(0.2)
-    return "ok"
+async def test_warning_flag_on_fallback(cfg: dict[str, Any]) -> None:
+  cfg_local = copy.deepcopy(cfg)
+  label, confidence, band_pct = _sample_inputs()
 
-  from src.nlp import explain as mod
+  async def _timeout(*args: Any, **kwargs: Any) -> str:
+    raise NLPTimeoutError("timeout")
 
-  monkeypatch.setattr(mod, "call_qwen_api", slow_qwen)
+  with (
+    patch("src.nlp.explain.call_qwen_api", new=_timeout),
+    patch("src.nlp.explain.call_gemma_fallback", new=_timeout),
+  ):
+    _, api_was_used = await generate_explanation(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg_local)
 
-  # Mock CV result available immediately.
-  cv_result = {"label": "spoof", "confidence": 0.9}
-  task = asyncio.create_task(generate_explanation(cv_result["label"], cv_result["confidence"], band_pct, cfg))
+  assert api_was_used is False
 
-  # Ensure UI/CV can display without awaiting NLP.
-  assert cv_result["label"] == "spoof"
-  assert isinstance(task, asyncio.Task)
 
-  text, api_used = await task
-  assert isinstance(text, str)
-  assert api_used is True
+@pytest.mark.asyncio
+async def test_cv_result_independent_of_nlp(cfg: dict[str, Any]) -> None:
+  cfg_local = copy.deepcopy(cfg)
+  label, confidence, band_pct = _sample_inputs()
+  started = asyncio.Event()
+  unblock = asyncio.Event()
+
+  async def _slow_call(*args: Any, **kwargs: Any) -> str:
+    started.set()
+    await unblock.wait()
+    return "api explanation"
+
+  with patch("src.nlp.explain.call_qwen_api", new=_slow_call):
+    task = asyncio.create_task(generate_explanation(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg_local))
+
+    # If `generate_explanation` blocks the event loop, this won't execute immediately.
+    cv_displayed = True
+    assert cv_displayed is True
+
+    # Task should be pending until we unblock the provider call.
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    await started.wait()
+    unblock.set()
+    explanation, api_was_used = await task
+
+  assert explanation == "api explanation"
+  assert api_was_used is True
 
 
 def test_no_api_key_in_source() -> None:
-  path = Path(__file__).resolve().parents[1] / "nlp" / "explain.py"
-  src = path.read_text(encoding="utf-8")
-
-  patterns = [
-    r"hf_[A-Za-z0-9]+",
-    r"sk-[A-Za-z0-9]+",
-    r"Bearer\\s+",
-  ]
+  src_path = Path(__file__).resolve().parents[2] / "src" / "nlp" / "explain.py"
+  text = src_path.read_text(encoding="utf-8")
+  patterns = [r"hf_", r"sk-", r"DASH", r"Bearer"]
   for pat in patterns:
-    assert re.search(pat, src) is None, f"Found forbidden token pattern: {pat}"
+    assert re.search(pat, text) is None
 
 
 @pytest.mark.asyncio
-async def test_cache_hit_skips_api(monkeypatch: pytest.MonkeyPatch, cfg: dict, band_pct: dict[str, float]) -> None:
-  calls = {"n": 0}
+async def test_cache_hit_skips_api(cfg: dict[str, Any]) -> None:
+  cfg_local = copy.deepcopy(cfg)
+  label, confidence, band_pct = _sample_inputs()
+  # Use a unique API return string so we can confirm it comes from cache on the second call.
+  api_text = "API explanation"
 
-  async def counting_qwen(*_args, **_kwargs) -> str:
-    calls["n"] += 1
-    return "cached text"
+  # Ensure cache is clean for this test key by disabling and re-enabling a new cache dict.
+  cfg_local.setdefault("nlp", {}).setdefault("caching", {}).setdefault("enabled", False)
+  # Force caching on for this test even if config.yaml disables it.
+  cfg_local["nlp"]["caching"]["enabled"] = True
+  cfg_local["nlp"]["_explanation_cache"] = {}
 
-  from src.nlp import explain as mod
+  with patch("src.nlp.explain.call_gemma_fallback", new=AsyncMock(side_effect=NLPTimeoutError("should not be called"))):
+    qwen_mock = AsyncMock(return_value=api_text)
+    with patch("src.nlp.explain.call_qwen_api", new=qwen_mock):
+      first_text, first_api_used = await generate_explanation(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg_local)
+      second_text, second_api_used = await generate_explanation(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg_local)
 
-  monkeypatch.setattr(mod, "call_qwen_api", counting_qwen)
+  assert first_text == api_text
+  assert first_api_used is True
+  assert second_text == api_text
+  assert second_api_used is True
+  assert qwen_mock.call_count == 1
 
-  text1, api1 = await generate_explanation("spoof", 0.91, band_pct, cfg)
-  assert text1 == "cached text"
-  assert api1 is True
-  assert calls["n"] == 1
-
-  # Second call should hit cache (same label + nearest bucket + top band)
-  cached = get_cached_explanation("spoof", 0.91, band_pct, cfg)
-  assert cached == "cached text"
-
-  text2, api2 = await generate_explanation("spoof", 0.91, band_pct, cfg)
-  assert text2 == "cached text"
-  assert api2 is True
-  assert calls["n"] == 1
+  # Also validate cache retrieval helper for the same key.
+  cached_text = get_cached_explanation(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg_local)
+  assert cached_text == api_text
 

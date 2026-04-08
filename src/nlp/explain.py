@@ -1,409 +1,490 @@
 """
 Module: src.nlp.explain
-SRS Reference: FR-NLP-001-009
-SDLC Phase: 3 - Environment Setup & MCP Configuration
+SRS Reference: FR-NLP-001–009
+SDLC Phase: 4 - Implementation (Sprint D)
 Sprint: D
 Pipeline Stage: NLP
 Purpose: Generate an English explanation from CV outputs (label, confidence, 4-band attribution) using Qwen 2.5 with fallback.
-Dependencies: httpx, aiohttp, asyncio.
+Dependencies: asyncio, os, openai (async)
 Interface Contract:
-  Input:  label: str, confidence: float, band_pct: dict[str, float] (sum == 100.0)
-  Output: tuple[str, bool] -> (English explanation paragraph (3–5 sentences), api_was_used flag)
-Latency Target: <= 8,000 ms API path; <= 100 ms fallback
-Open Questions Resolved: Q6 resolved (UI ordering contract), Q4/Q5 resolved (XAI inputs contract)
+  Input:  label: str, confidence: float, band_pct: dict[str, float] (band_pct includes 4 keys; sum ~= 100.0)
+  Output: tuple[str, bool] from `generate_explanation` => (explanation_text, api_was_used)
+  Note: `build_prompt` returns str prompt only; `build_rule_based_explanation` returns str explanation only.
+Latency Target: <= 8,000 ms API path (per `cfg['nlp']['timeout_sec']`), <= 100 ms fallback on CPU (rule-based)
+Open Questions Resolved: Q6 (UI ordering) and Q4/Q5 input contract alignment (Sprint D scope)
 Open Questions Blocking: None for Sprint D
-MCP Tools Used: context7-mcp | huggingface-mcp | stitch-mcp
+MCP Tools Used: stitch-mcp (conceptual API orchestration), context7-mcp, huggingface-mcp
 AI Generated: true
 Verified (V.E.R.I.F.Y.): false
 Author: Ferel / Safa
-Date: 2026-04-03
+Date: 2026-04-02
 """
 
 from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, Optional
+from dataclasses import dataclass
+from typing import Any
 
-from openai import APIError, APIConnectionError, APITimeoutError, AsyncOpenAI, RateLimitError
-
-from src.utils.logger import log_warning
+from src.utils.logger import log_info, log_warning
 
 
-class NLPTimeoutError(Exception):
-  """
-  Raised when an NLP provider call exceeds configured timeout.
+class NLPTimeoutError(TimeoutError):
+  """Raised when an NLP provider call times out or fails.
 
   Args:
-    provider: Provider identifier (e.g., "qwen_2_5").
-    timeout_sec: Timeout threshold in seconds.
-  """
-
-  def __init__(self, provider: str, timeout_sec: float) -> None:
-    self.provider = provider
-    self.timeout_sec = timeout_sec
-    super().__init__(f"NLP provider '{provider}' timed out after {timeout_sec:.3f}s")
-
-
-def _top_band(band_pct: dict[str, float]) -> tuple[str, float]:
-  """
-  Return the top-attribution band.
-
-  Args:
-    band_pct: Dict with exactly 4 bands: low, low_mid, high_mid, high (sum ~ 100).
+    message: Human-readable description of why the provider failed.
 
   Returns:
-    (band_name, band_value_pct)
+    None.
+
+  Raises:
+    None (this is an exception type).
   """
 
+
+@dataclass(frozen=True)
+class _CacheRecord:
+  """Internal cache record used by the NLP explanation module.
+
+  Args:
+    text: Cached explanation text.
+    api_was_used: Whether an external API produced the cached text.
+  """
+
+  text: str
+  api_was_used: bool
+
+
+def _confidence_to_ratio(confidence: float) -> float:
+  """
+  Convert confidence into a ratio in [0, 1] for caching bucketing.
+
+  Args:
+    confidence: Either a ratio (0..1) or a percent-like value (>1). Must be finite.
+      - Per FR-CV-004, model inference confidence is a probability in (0, 1).
+
+  Returns:
+    float ratio in [0, 1] (clamped).
+
+  Raises:
+    ValueError: If confidence is NaN or infinite.
+  """
+  x = float(confidence)
+  if not (x == x) or x in (float("inf"), float("-inf")):
+    raise ValueError("confidence must be finite")
+  # If confidence looks like "92.0", treat as percent. Otherwise treat as probability.
+  ratio = x / 100.0 if x > 1.0 else x
+  return max(0.0, min(1.0, ratio))
+
+
+def _ratio_to_percent_text(confidence: float) -> float:
+  """
+  Convert confidence into a percentage value for human-readable text.
+
+  Args:
+    confidence: Ratio (0..1) or percent-like value (>1).
+
+  Returns:
+    float in [0, 100] representing the displayed percentage.
+
+  Raises:
+    ValueError: If confidence is NaN or infinite.
+  """
+  ratio = _confidence_to_ratio(confidence)
+  return ratio * 100.0
+
+
+def _get_top_band_name(band_pct: dict[str, float]) -> str:
+  """
+  Get the band with the highest attribution.
+
+  Args:
+    band_pct: Frequency-band attribution dict with float percentages.
+
+  Returns:
+    Top band name as str.
+
+  Raises:
+    ValueError: If band_pct is empty.
+  """
   if not band_pct:
     raise ValueError("band_pct must be non-empty")
-  band = max(band_pct.items(), key=lambda kv: float(kv[1]))
-  return str(band[0]), float(band[1])
+  top_name, _ = max(band_pct.items(), key=lambda kv: float(kv[1]))
+  return str(top_name)
+
+
+def _confidence_bucket(confidence: float, cfg: dict[str, Any]) -> float:
+  """
+  Bucket a confidence ratio to the nearest configured confidence bucket.
+
+  Args:
+    confidence: Ratio (0..1) or percent-like (>1) confidence.
+      - Per FR-NLP-008 cache key uses nearest bucket from `cfg['nlp']['caching']['confidence_buckets']`.
+
+    cfg: Full configuration mapping.
+
+  Returns:
+    float bucket value taken from cfg.
+
+  Raises:
+    KeyError: If caching buckets are missing from cfg.
+  """
+  ratio = _confidence_to_ratio(confidence)
+  buckets = cfg["nlp"]["caching"]["confidence_buckets"]
+  bucket = min((float(b) for b in buckets), key=lambda b: abs(b - ratio))
+  return float(bucket)
+
+
+def _cache_enabled(cfg: dict[str, Any]) -> bool:
+  """
+  Check whether explanation caching is enabled.
+
+  Args:
+    cfg: Full configuration mapping.
+
+  Returns:
+    True if caching is enabled for NLP.
+
+  Raises:
+    KeyError: If cfg structure lacks expected keys.
+  """
+  return bool(cfg["nlp"]["caching"].get("enabled", False))
+
+
+def _cache_key(label: str, confidence: float, band_pct: dict[str, float], cfg: dict[str, Any]) -> tuple[str, float, str]:
+  """
+  Build the cache key used for NLP explanation caching.
+
+  Args:
+    label: Model label (e.g., 'bonafide' or 'spoof').
+    confidence: Confidence (ratio or percent-like); bucketed to nearest configured value.
+    band_pct: 4-band attribution dict.
+    cfg: Full configuration mapping.
+
+  Returns:
+    Tuple of (label, confidence_bucket, top_band_name).
+
+  Raises:
+    ValueError: If band_pct is empty.
+  """
+  top_band = _get_top_band_name(band_pct)
+  bucket = _confidence_bucket(confidence, cfg)
+  return str(label), bucket, top_band
+
+
+def _get_cache_dict(cfg: dict[str, Any]) -> dict[tuple[str, float, str], _CacheRecord]:
+  """
+  Return the in-memory cache dict stored inside cfg.
+
+  Args:
+    cfg: Full configuration mapping. Cache is stored under `cfg['nlp']['_explanation_cache']`.
+
+  Returns:
+    Cache mapping from cache_key => _CacheRecord.
+
+  Raises:
+    KeyError: If cfg structure is missing 'nlp'.
+  """
+  cfg_nlp = cfg["nlp"]
+  cache = cfg_nlp.setdefault("_explanation_cache", {})
+  # typing: cache is intentionally mutable inside cfg for runtime memoization
+  return cache
 
 
 def build_prompt(label: str, confidence: float, band_pct: dict[str, float], cfg: dict[str, Any]) -> str:
   """
-  Construct structured prompt: label + confidence + band percentages.
+  Construct a structured prompt for the primary Qwen explanation provider.
 
   Args:
-    label: "bonafide" or "spoof".
-    confidence: Confidence for predicted label in [0, 1] (clamped in display only).
-    band_pct: Dict with 4 frequency bands summing to ~100.0.
-    cfg: Config mapping; uses `nlp.explanation_min_sentences` and `nlp.explanation_max_sentences`.
+    label: Predicted class label from CV ('bonafide' or 'spoof').
+    confidence: CV confidence (probability ratio in (0, 1) per FR-CV-004 or percent-like >1).
+      - Used in prompt as a numeric confidence value.
+    band_pct: Dict[str, float] with 4 frequency bands; values are percentages summing to ~100.0.
+    cfg: Full configuration mapping (includes prompt sentence constraints).
 
   Returns:
-    Prompt string (no API call) per FR-NLP-001.
-  """
-
-  nlp_cfg = cfg.get("nlp", {})
-  min_s = int(nlp_cfg.get("explanation_min_sentences", 3))
-  max_s = int(nlp_cfg.get("explanation_max_sentences", 5))
-  top_name, top_val = _top_band(band_pct)
-
-  lines = [
-    "You are an assistant explaining an audio deepfake detection result.",
-    f"Prediction label: {label}",
-    f"Confidence: {float(confidence):.6f}",
-    "Frequency band attributions (percent, sum≈100):",
-    f"- low: {float(band_pct.get('low', 0.0)):.4f}",
-    f"- low_mid: {float(band_pct.get('low_mid', 0.0)):.4f}",
-    f"- high_mid: {float(band_pct.get('high_mid', 0.0)):.4f}",
-    f"- high: {float(band_pct.get('high', 0.0)):.4f}",
-    "",
-    f"Write a concise English explanation in {min_s}–{max_s} sentences.",
-    f"Explicitly mention that the highest activation was in the '{top_name}' band ({top_val:.2f}%).",
-    "Avoid mentioning training data or implementation details. Keep it user-friendly.",
-  ]
-  return "\n".join(lines)
-
-
-def _resolve_nlp_api_key(*, key_env_var_name: str) -> str:
-  """
-  Read API key from environment using the configured env var name only.
-
-  Args:
-    key_env_var_name: Environment variable name (from config, never a literal secret).
-
-  Returns:
-    API key string.
+    A prompt string containing: label, confidence, and all 4 band percentages.
 
   Raises:
-    RuntimeError: If env var name is empty or key is missing (NLP-001 per FR-NLP-005).
+    ValueError: If band_pct does not contain 4 bands.
   """
+  expected_keys = ["low", "low_mid", "high_mid", "high"]
+  missing = [k for k in expected_keys if k not in band_pct]
+  if missing:
+    raise ValueError(f"band_pct missing required keys: {missing}")
 
-  key_var = str(key_env_var_name).strip()
-  if not key_var:
-    raise RuntimeError("NLP API key env var name missing in config")
-  api_key = os.environ.get(key_var)
-  if not api_key:
-    raise RuntimeError(f"Missing API key env var: {key_var}")
-  return api_key
+  top_band = _get_top_band_name(band_pct)
+  conf_ratio = _confidence_to_ratio(confidence)
+  conf_pct = conf_ratio * 100.0
 
+  min_s = int(cfg["nlp"]["explanation_min_sentences"])
+  max_s = int(cfg["nlp"]["explanation_max_sentences"])
+  if min_s < 1 or max_s < min_s:
+    raise ValueError("Invalid sentence constraints in cfg['nlp']")
 
-def _nlp_key_env_for_provider(nlp_cfg: dict[str, Any], *, provider: str) -> str:
-  """
-  Resolve which environment variable holds the API key for a provider.
-
-  Args:
-    nlp_cfg: `cfg["nlp"]` mapping.
-    provider: "qwen" or "gemma".
-
-  Returns:
-    Env var name string.
-  """
-
-  if provider == "gemma":
-    gemma_var = str(nlp_cfg.get("gemma_api_key_env_var", "") or "").strip()
-    if gemma_var:
-      return gemma_var
-    hub_token_env = str(nlp_cfg.get("hf" + "_token_env_var", "") or "").strip()
-    if hub_token_env:
-      return hub_token_env
-  return str(nlp_cfg.get("api_key_env_var", "") or "").strip()
-
-
-async def _call_openai_compatible_chat(
-  prompt: str,
-  cfg: dict[str, Any],
-  *,
-  model_name: str,
-  provider: str,
-) -> str:
-  """
-  Call an OpenAI-compatible chat endpoint using env-provided API key only.
-
-  Args:
-    prompt: Prompt string.
-    cfg: Config mapping; reads `nlp.api_key_env_var`, optional `nlp.base_url`.
-    model_name: Provider-specific model identifier from config.yaml.
-    provider: "qwen" or "gemma" for key resolution.
-
-  Returns:
-    Response text.
-
-  Raises:
-    RuntimeError: If API key env var is missing or unset.
-    APIError: On provider HTTP/API errors.
-  """
-
-  nlp_cfg = cfg.get("nlp", {})
-  key_var = _nlp_key_env_for_provider(nlp_cfg, provider=provider)
-  api_key = _resolve_nlp_api_key(key_env_var_name=key_var)
-
-  base_url_raw = nlp_cfg.get("base_url", None)
-  base_url = str(base_url_raw).strip() if base_url_raw not in (None, "") else None
-  client = AsyncOpenAI(api_key=api_key, base_url=base_url) if base_url else AsyncOpenAI(api_key=api_key)
-
-  resp = await client.chat.completions.create(
-    model=str(model_name),
-    messages=[{"role": "user", "content": prompt}],
+  bands_block = "\n".join(
+    f"- {k}: {float(band_pct[k]):.2f}%"
+    for k in expected_keys
   )
-  content = resp.choices[0].message.content if resp.choices else None
-  return str(content or "").strip()
+
+  prompt = (
+    "You are a reliable explainability assistant for a deepfake speech detector.\n"
+    f"Predicted label: {label}\n"
+    f"Confidence (probability): {conf_ratio}\n"
+    f"Confidence (%): {conf_pct:.2f}%\n"
+    "4 frequency-band attribution percentages (sum ~= 100%):\n"
+    f"{bands_block}\n"
+    f"Highest-attribution band: {top_band}\n\n"
+    f"Instruction: Produce {min_s}-{max_s} sentences of clear English explaining the result.\n"
+    f"Your explanation MUST cite the highest-attribution band and connect it to the label.\n"
+    "Avoid speculation beyond what the attribution implies."
+  )
+  return prompt
 
 
 async def call_qwen_api(prompt: str, cfg: dict[str, Any]) -> str:
   """
-  Use Qwen 2.5 provider with timeout enforcement (FR-NLP-002).
+  Call Qwen 2.5 via an OpenAI-compatible async API client (primary provider).
 
   Args:
-    prompt: Prompt string from `build_prompt`.
-    cfg: Config mapping; uses `nlp.timeout_sec`, `nlp.qwen_model`.
+    prompt: User prompt string from `build_prompt`.
+    cfg: Full configuration mapping.
+      - Uses cfg['nlp']['api_key_env_var'] to look up the API key via os.environ.
+      - Uses cfg['nlp']['timeout_sec'] as the asyncio.wait_for timeout.
 
   Returns:
-    Qwen response text.
+    Provider response text as str (English explanation).
 
   Raises:
-    NLPTimeoutError: If the call exceeds timeout.
+    NLPTimeoutError: On timeout or any provider exception.
+      - Per FR-NLP-002: enforce timeout and use this error type for fallback.
   """
+  api_key_env = str(cfg["nlp"]["api_key_env_var"])
+  api_key = os.environ.get(api_key_env)
+  timeout_sec = float(cfg["nlp"]["timeout_sec"])
 
-  nlp_cfg = cfg.get("nlp", {})
-  timeout_sec = float(nlp_cfg.get("timeout_sec", 30))
-  model_name = str(nlp_cfg.get("qwen_model", "")).strip()
-  if not model_name:
-    raise RuntimeError("nlp.qwen_model missing in config")
   try:
-    return await asyncio.wait_for(
-      _call_openai_compatible_chat(prompt, cfg, model_name=model_name, provider="qwen"),
-      timeout=timeout_sec,
+    # Lazy import to keep module import side effects minimal in test runners.
+    from openai import AsyncOpenAI  # type: ignore
+
+    # Read OpenAI-compatible base URL from config (HF Inference).
+    pythonbase_url = str(cfg["nlp"].get("base_url", "https://api-inference.huggingface.co/v1/"))
+    model = str(cfg["nlp"]["primary_provider"])
+
+    client = AsyncOpenAI(api_key=api_key, base_url=pythonbase_url)
+    system_msg = "Reply in English. Provide 3-5 sentences. Cite the highest attribution band."
+    coro = client.chat.completions.create(
+      model=model,
+      messages=[
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": prompt},
+      ],
     )
+    resp = await asyncio.wait_for(coro, timeout=timeout_sec)
+
+    content = resp.choices[0].message.content if resp.choices else None
+    return str(content or "").strip()
   except asyncio.TimeoutError as exc:
-    raise NLPTimeoutError(provider="qwen_2_5", timeout_sec=timeout_sec) from exc
+    raise NLPTimeoutError("Qwen API timeout") from exc
+  except Exception as exc:
+    raise NLPTimeoutError("Qwen API error") from exc
 
 
 async def call_gemma_fallback(prompt: str, cfg: dict[str, Any]) -> str:
   """
-  Secondary fallback provider (FR-NLP-007 SHOULD).
+  Call the secondary fallback provider (e.g., Gemma-3) via an OpenAI-compatible async client.
 
   Args:
-    prompt: Prompt string.
-    cfg: Config mapping; uses `nlp.timeout_sec`, `nlp.gemma_model`.
+    prompt: Prompt string from `build_prompt`.
+    cfg: Full configuration mapping.
+      - Uses cfg['nlp']['timeout_sec'] as the asyncio.wait_for timeout.
 
   Returns:
-    Fallback response text.
+    Provider response text as str.
 
   Raises:
-    NLPTimeoutError: If the call exceeds timeout.
+    NLPTimeoutError: On timeout or any provider exception.
+      - Per FR-NLP-007 SHOULD: enforce timeout and use this error type for fallback.
   """
-
-  nlp_cfg = cfg.get("nlp", {})
-  timeout_sec = float(nlp_cfg.get("timeout_sec", 30))
-  model_name = str(nlp_cfg.get("gemma_model", "")).strip()
-  if not model_name:
-    raise RuntimeError("nlp.gemma_model missing in config")
+  timeout_sec = float(cfg["nlp"]["timeout_sec"])
   try:
-    return await asyncio.wait_for(
-      _call_openai_compatible_chat(prompt, cfg, model_name=model_name, provider="gemma"),
-      timeout=timeout_sec,
+    from openai import AsyncOpenAI  # type: ignore
+
+    # Read OpenAI-compatible base URL from config (HF Inference).
+    pythonbase_url = str(cfg["nlp"].get("base_url", "https://api-inference.huggingface.co/v1/"))
+    model = str(cfg["nlp"]["fallback_provider"])
+
+    # Prefer a Qwen-proxy key if present; otherwise allow stitch-mcp to handle auth upstream.
+    api_key_env = str(cfg["nlp"]["api_key_env_var"])
+    api_key = os.environ.get(api_key_env)
+
+    client = AsyncOpenAI(api_key=api_key, base_url=pythonbase_url)
+    coro = client.chat.completions.create(
+      model=model,
+      messages=[
+        {"role": "system", "content": "Reply in English. Provide 3-5 sentences. Cite the highest attribution band."},
+        {"role": "user", "content": prompt},
+      ],
     )
+    resp = await asyncio.wait_for(coro, timeout=timeout_sec)
+    content = resp.choices[0].message.content if resp.choices else None
+    return str(content or "").strip()
   except asyncio.TimeoutError as exc:
-    raise NLPTimeoutError(provider="gemma_fallback", timeout_sec=timeout_sec) from exc
+    raise NLPTimeoutError("Gemma fallback timeout") from exc
+  except Exception as exc:
+    raise NLPTimeoutError("Gemma fallback error") from exc
 
 
 def build_rule_based_explanation(label: str, confidence: float, band_pct: dict[str, float]) -> str:
   """
-  Always-available rule-based explanation (FR-NLP-003).
+  Generate a deterministic, always-available rule-based English explanation.
 
   Args:
-    label: "bonafide" or "spoof".
-    confidence: Confidence value in [0, 1].
-    band_pct: 4-band attribution dict.
+    label: Predicted class label ('bonafide' or 'spoof').
+    confidence: CV confidence (ratio in (0, 1) or percent-like >1).
+    band_pct: Frequency-band attribution dict with 4 required keys.
 
   Returns:
-    English text with >= 3 sentences (FR-NLP-004).
+    English explanation string with 3-5 sentences.
+      - Per FR-NLP-003/FR-NLP-004, must be grammatically correct English.
+
+  Raises:
+    ValueError: If required band keys are missing.
   """
+  expected_keys = ["low", "low_mid", "high_mid", "high"]
+  missing = [k for k in expected_keys if k not in band_pct]
+  if missing:
+    raise ValueError(f"band_pct missing required keys: {missing}")
 
-  top_name, top_val = _top_band(band_pct)
-  conf_pct = max(0.0, min(1.0, float(confidence))) * 100.0
+  top_band = _get_top_band_name(band_pct)
+  top_val = float(band_pct[top_band])
+  conf_pct = _ratio_to_percent_text(confidence)
 
-  if str(label).lower() == "spoof":
-    label_phrase = "AI-generated (spoof) speech"
-    implication = "This pattern can reflect synthetic artifacts or unnatural spectral emphasis."
+  label_norm = str(label).strip().lower()
+  label_phrase = "bonafide" if label_norm == "bonafide" else "spoof" if label_norm == "spoof" else label
+
+  # Minimal, attribution-grounded heuristics.
+  if top_band == "low":
+    interpret = "dominant low-frequency energy can reflect natural speech cadence"
+  elif top_band == "low_mid":
+    interpret = "mid-frequency emphasis often aligns with phonetic structure"
+  elif top_band == "high_mid":
+    interpret = "high-mid activation can indicate texture and consonant-like components"
   else:
-    label_phrase = "bonafide (human) speech"
-    implication = "This pattern is more consistent with natural speech dynamics in the spectrogram."
+    interpret = "high-frequency concentration can be associated with sharper spectral artifacts"
 
-  band_hint = {
-    "low": "lower-frequency energy such as voicing and fundamental components",
-    "low_mid": "formant structure and speech body",
-    "high_mid": "consonant detail and transitions",
-    "high": "high-frequency detail and sharp spectral edges",
-  }.get(top_name, "frequency-specific evidence")
+  # FR-NLP-003 template requirement.
+  sentence1 = f"Analysis indicates {label_phrase} speech with {conf_pct:.2f}% confidence."
+  sentence2 = f"The {top_band} frequency band ({top_val:.2f}%) showed the highest activation, suggesting {interpret}."
 
-  sentences = [
-    f"Analysis indicates {label_phrase} with {conf_pct:.1f}% confidence.",
-    f"The {top_name} band ({top_val:.1f}%) showed the highest activation, suggesting emphasis on {band_hint}.",
-    implication,
-    "Treat this explanation as supportive evidence and consider recording conditions when interpreting the result.",
-  ]
-  return " ".join(sentences[:4])
+  # One extra sentence conditioned on label for stronger rule-based alignment.
+  if label_norm == "spoof":
+    sentence3 = "Overall, the strongest band suggests the model is leveraging spectral characteristics typical of synthetic or manipulated speech."
+  else:
+    sentence3 = "Overall, the strongest band suggests the model is leveraging natural spectral patterns consistent with genuine speech."
+
+  sentence4 = (
+    f"This attribution summary is based on relative band activation rather than external metadata, "
+    f"so it reflects the model's focus during classification."
+  )
+
+  # Keep within 3-5 sentences; return 4 sentences for robustness.
+  return " ".join([sentence1, sentence2, sentence3, sentence4]).strip()
 
 
-def _nearest_bucket(confidence: float, buckets: list[float]) -> float:
+async def generate_explanation(
+  label: str,
+  confidence: float,
+  band_pct: dict[str, float],
+  cfg: dict[str, Any],
+) -> tuple[str, bool]:
   """
-  Round confidence to the nearest configured bucket (FR-NLP-008).
+  Orchestrate explanation generation with caching and a Qwen -> Gemma -> rule-based fallback chain.
 
   Args:
-    confidence: Confidence value in [0, 1] (clamped).
-    buckets: Bucket list.
+    label: Predicted class label ('bonafide' or 'spoof').
+    confidence: CV confidence (probability ratio in (0, 1) or percent-like >1).
+    band_pct: Frequency-band attribution dict with 4 required keys.
+    cfg: Full configuration mapping.
 
   Returns:
-    Nearest bucket value.
+    (explanation_text, api_was_used)
+      - api_was_used is False only when the final output is rule-based due to API failures (FR-NLP-003).
+
+  Raises:
+    ValueError: If inputs are invalid (e.g., missing bands).
   """
-
-  if not buckets:
-    return float(confidence)
-  x = max(0.0, min(1.0, float(confidence)))
-  return min((float(b) for b in buckets), key=lambda b: abs(b - x))
-
-
-def get_cached_explanation(label: str, confidence: float, band_pct: dict[str, float], cfg: dict[str, Any]) -> Optional[str]:
-  """
-  Return cached explanation if available (FR-NLP-008 SHOULD).
-
-  Args:
-    label: Predicted label.
-    confidence: Confidence value.
-    band_pct: Band percentages.
-    cfg: Config mapping; cache stored in `cfg['_nlp_cache']`.
-
-  Returns:
-    Cached explanation if present, else None.
-  """
-
-  caching_cfg = cfg.get("nlp", {}).get("caching", {})
-  if not bool(caching_cfg.get("enabled", False)):
-    return None
-
-  buckets = [float(x) for x in caching_cfg.get("confidence_buckets", [])]
-  bucket = _nearest_bucket(confidence, buckets)
-  top_name, _ = _top_band(band_pct)
-  key = (str(label), float(bucket), str(top_name))
-
-  cache: dict[tuple[str, float, str], str] = cfg.setdefault("_nlp_cache", {})  # type: ignore[assignment]
-  return cache.get(key)
-
-
-def _set_cached_explanation(label: str, confidence: float, band_pct: dict[str, float], cfg: dict[str, Any], text: str) -> None:
-  """
-  Store explanation in cache.
-
-  Args:
-    label: Predicted label.
-    confidence: Confidence value.
-    band_pct: Band percentages.
-    cfg: Config mapping.
-    text: Explanation to store.
-  """
-
-  caching_cfg = cfg.get("nlp", {}).get("caching", {})
-  if not bool(caching_cfg.get("enabled", False)):
-    return
-
-  buckets = [float(x) for x in caching_cfg.get("confidence_buckets", [])]
-  bucket = _nearest_bucket(confidence, buckets)
-  top_name, _ = _top_band(band_pct)
-  key = (str(label), float(bucket), str(top_name))
-
-  cache: dict[tuple[str, float, str], str] = cfg.setdefault("_nlp_cache", {})  # type: ignore[assignment]
-  cache[key] = str(text)
-
-
-async def generate_explanation(label: str, confidence: float, band_pct: dict[str, float], cfg: dict[str, Any]) -> tuple[str, bool]:
-  """
-  Orchestrate Qwen 2.5 → Gemma fallback → rule-based fallback (FR-NLP-006).
-
-  Args:
-    label: Predicted label.
-    confidence: Confidence for label.
-    band_pct: 4-band attribution dict.
-    cfg: Full config mapping including `nlp`.
-
-  Returns:
-    (explanation_text, api_was_used). True when Qwen returned text or cache hit; False when Gemma
-    or rule-based path produced the text.
-  """
-
-  cached = get_cached_explanation(label, confidence, band_pct, cfg)
-  if cached is not None:
-    return cached, True
+  if _cache_enabled(cfg):
+    cached_text = get_cached_explanation(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+    if cached_text is not None:
+      cache_key = _cache_key(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+      cache_record = _get_cache_dict(cfg).get(cache_key)
+      api_was_used = bool(cache_record.api_was_used) if cache_record is not None else True
+      return cached_text, api_was_used
 
   prompt = build_prompt(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+  api_was_used = False
+  explanation_text = ""
 
+  # Qwen 2.5 primary.
   try:
-    text = await call_qwen_api(prompt, cfg)
-    if text:
-      _set_cached_explanation(label, confidence, band_pct, cfg, text)
-      return text, True
-  except (
-    NLPTimeoutError,
-    RuntimeError,
-    APIError,
-    APIConnectionError,
-    APITimeoutError,
-    RateLimitError,
-    ValueError,
-  ) as exc:
-    log_warning(stage="nlp", message="qwen_failed", data={"reason": str(exc)})
-  except Exception as exc:  # noqa: BLE001 — NLP path must not abort CV pipeline
-    log_warning(stage="nlp", message="qwen_failed_unexpected", data={"reason": str(exc)})
+    explanation_text = await call_qwen_api(prompt=prompt, cfg=cfg)
+    api_was_used = True
+    log_info(stage="nlp", message="qwen_explanation_success", data={"label": label})
+  except NLPTimeoutError:
+    log_warning(stage="nlp", message="qwen_explanation_failed_fallback", data={"label": label})
 
+  if api_was_used:
+    if _cache_enabled(cfg):
+      cache_key = _cache_key(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+      _get_cache_dict(cfg)[cache_key] = _CacheRecord(text=explanation_text, api_was_used=True)
+    return explanation_text, True
+
+  # Secondary Gemma-3 fallback (SHOULD).
   try:
-    text = await call_gemma_fallback(prompt, cfg)
-    if text:
-      return text, False
-  except (
-    NLPTimeoutError,
-    RuntimeError,
-    APIError,
-    APIConnectionError,
-    APITimeoutError,
-    RateLimitError,
-    ValueError,
-  ) as exc:
-    log_warning(stage="nlp", message="gemma_failed", data={"reason": str(exc)})
-  except Exception as exc:  # noqa: BLE001 — NLP path must not abort CV pipeline
-    log_warning(stage="nlp", message="gemma_failed_unexpected", data={"reason": str(exc)})
+    explanation_text = await call_gemma_fallback(prompt=prompt, cfg=cfg)
+    api_was_used = True
+    log_info(stage="nlp", message="gemma_fallback_success", data={"label": label})
+  except NLPTimeoutError:
+    log_warning(stage="nlp", message="gemma_explanation_failed_rule_fallback", data={"label": label})
 
-  return build_rule_based_explanation(label, confidence, band_pct), False
+  if api_was_used:
+    if _cache_enabled(cfg):
+      cache_key = _cache_key(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+      _get_cache_dict(cfg)[cache_key] = _CacheRecord(text=explanation_text, api_was_used=True)
+    return explanation_text, True
+
+  # Final always-available rule-based explanation.
+  explanation_text = build_rule_based_explanation(label=label, confidence=confidence, band_pct=band_pct)
+  api_was_used = False
+
+  if _cache_enabled(cfg):
+    cache_key = _cache_key(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+    _get_cache_dict(cfg)[cache_key] = _CacheRecord(text=explanation_text, api_was_used=False)
+
+  return explanation_text, api_was_used
+
+
+def get_cached_explanation(label: str, confidence: float, band_pct: dict[str, float], cfg: dict[str, Any]) -> str | None:
+  """
+  Retrieve a cached NLP explanation from cfg (if caching is enabled).
+
+  Args:
+    label: Predicted class label.
+    confidence: Confidence used to compute a cache bucket key.
+    band_pct: Frequency-band attribution dict used to compute top band name.
+    cfg: Full configuration mapping.
+
+  Returns:
+    Cached explanation text if present, else None.
+
+  Raises:
+    ValueError: If band_pct is empty.
+  """
+  if not _cache_enabled(cfg):
+    return None
+  cache_key = _cache_key(label=label, confidence=confidence, band_pct=band_pct, cfg=cfg)
+  cache_record = _get_cache_dict(cfg).get(cache_key)
+  return cache_record.text if cache_record is not None else None

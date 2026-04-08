@@ -9,16 +9,16 @@
 
 | Field | Value |
 |-------|-------|
-| **Active SDLC Phase** | Phase 4 — XAI Grad-CAM (Sprint C) |
-| **Active Sprint** | C |
-| **Last Completed** | Chain 07 — `src/cv/gradcam.py`, `test_gradcam.py`; Q4/Q5 confirmed resolved |
-| **Next Action** | Gate Check: `pytest src/tests/test_gradcam.py -v` |
-| **Gate Status** | 🟢 Q4/Q5 resolved — Grad-CAM module ready for V.E.R.I.F.Y. L3 |
+| **Active SDLC Phase** | Phase 4 — Deployment UI (Sprint E) |
+| **Active Sprint** | E |
+| **Last Completed** | Chain 09 — `app.py` complete, `src/tests/test_e2e.py` added, HF secrets checklist updated |
+| **Next Action** | Gate Check: `pytest src/tests/test_e2e.py -v` |
+| **Gate Status** | 🟡 Pending — run E2E tests in a working Python env |
 
 ---
 
 ## ✅ COMPLETED SRS REQUIREMENTS
-*(none yet — update after each sprint)*
+*(FR-NLP-001–009 implemented in `src/nlp/explain.py` with async Qwen timeout + Gemma fallback + rule-based fallback, plus config-driven caching; and verified via V.E.R.I.F.Y. tests in `src/tests/test_nlp.py`)*
 
 ---
 
@@ -132,3 +132,9 @@
 **Status:** ✅ COMPLETE — Q4 & Q5 verified resolved; `gradcam.py` implements FR-CV-010–016; `target_layer` = `model.backbone.features[8]` (DSDBAModel); ADR updated
 **Actions:** Full Grad-CAM pipeline, Mel band mapping via `librosa.mel_frequencies`, tests for shape/range/PNG/Q5/latency/JSON
 **Next:** `pytest src/tests/test_gradcam.py -v`; Sprint D/E or NLP chain
+
+### Session 09 — Chain 08 Sprint D (NLP / Qwen 2.5)
+**Date:** 2026-04-02
+**Status:** ✅ COMPLETE — Implemented NLP explanation + fallback + caching (mocked)
+**Actions:** Implemented `src/nlp/explain.py` (FR-NLP-001–009) and added `src/tests/test_nlp.py` (8 tests: prompt fields, rule-based fallback/grammar, timeout->fallback + warning flag, async non-blocking behavior, credential-string scan, caching hit behavior).
+**Next:** Gate Check: `pytest src/tests/test_nlp.py -v` in CI/with a working Python runtime

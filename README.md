@@ -1,3 +1,16 @@
+---
+title: DSDBA Fried KCV
+emoji: 🎤
+colorFrom: blue
+colorTo: purple
+sdk: gradio
+sdk_version: "4.44.1"
+app_file: app.py
+# torch==2.1.0 has no cp313 wheels; default Space image is Python 3.13 — pin 3.10 for reproducible installs.
+python_version: "3.10"
+pinned: false
+---
+
 DSDBA - Deepfake Speech Detection & Biometric Authentication System
 ==========================================================
 
@@ -91,6 +104,17 @@ The notebook includes:
 ## Deployment Demo (HF Spaces)
 
 HF Spaces link (placeholder): `TBD`
+
+### HF Spaces secrets checklist (FR-NLP-005)
+
+Set these **Secrets** in your Hugging Face Space (Settings → Secrets):
+
+- `HF_API_KEY`: API key used by the OpenAI-compatible client to call Hugging Face Inference Chat Completions
+- `HF_TOKEN`: Hugging Face token (used for Hub uploads in training utilities)
+
+Notes:
+- Do **not** hardcode API keys in code or commit them to git.
+- `config.yaml` reads the key name from `nlp.api_key_env_var` (currently `HF_API_KEY`).
 
 ## Demo Preview
 
