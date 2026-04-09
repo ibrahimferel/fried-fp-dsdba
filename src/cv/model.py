@@ -50,7 +50,7 @@ class DSDBAModel(nn.Module):
         message="efficientnet_pretrained_unavailable",
         data={"reason": str(exc)},
       )
-
+#makan
     in_features = int(self.backbone.classifier[-1].in_features)
     self.backbone.classifier[-1] = nn.Linear(in_features, num_classes)
 
